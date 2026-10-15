@@ -12,6 +12,46 @@
 static const CLSID CLSID_CmdCommand = 
     { 0xd3a8e4f1, 0x6b22, 0x4d90, { 0x9e, 0x11, 0x5a, 0x8e, 0x89, 0x3c, 0x41, 0x77 } };
 
+// Validates that the target is a genuine physical filesystem folder/file
+bool IsValidFilesystemLocation(IShellItemArray* psiItemArray) {
+    if (!psiItemArray) return false;
+    DWORD count = 0;
+    if (FAILED(psiItemArray->GetCount(&count)) || count == 0) return false;
+
+    IShellItem* item = nullptr;
+    if (FAILED(psiItemArray->GetItemAt(0, &item))) return false;
+
+    // Reject virtual locations (This PC, Recycle Bin, Network, Control Panel, Phones/MTP)
+    SFGAOF attributes = 0;
+    if (FAILED(item->GetAttributes(SFGAO_FILESYSTEM, &attributes)) || !(attributes & SFGAO_FILESYSTEM)) {
+        item->Release();
+        return false;
+    }
+
+    PWSTR rawPath = nullptr;
+    if (FAILED(item->GetDisplayName(SIGDN_FILESYSPATH, &rawPath))) {
+        item->Release();
+        return false;
+    }
+
+    std::wstring path = rawPath;
+    CoTaskMemFree(rawPath);
+    item->Release();
+
+    if (path.empty()) return false;
+
+    // Check if it's an existing directory or drive (C:\, D:\, folders)
+    if (PathIsDirectoryW(path.c_str())) {
+        return PathFileExistsW(path.c_str()) != FALSE;
+    }
+
+    // If it's a file, ensure its parent directory exists
+    WCHAR parentDir[MAX_PATH] = { 0 };
+    wcscpy_s(parentDir, path.c_str());
+    PathRemoveFileSpecW(parentDir);
+    return PathIsDirectoryW(parentDir) != FALSE;
+}
+
 class CmdCommand : public IExplorerCommand, public IObjectWithSelection
 {
     LONG m_cRef = 1;
@@ -66,15 +106,28 @@ public:
         *pguid = CLSID_CmdCommand;
         return S_OK;
     }
-    IFACEMETHODIMP GetState(IShellItemArray*, BOOL fOkToBeSlow, EXPCMDSTATE* pCmdState) override {
+
+    // Dynamic visibility check
+    IFACEMETHODIMP GetState(IShellItemArray* psiItemArray, BOOL fOkToBeSlow, EXPCMDSTATE* pCmdState) override {
         if (!pCmdState) return E_POINTER;
+
+        // Hide from classic context menu
         if (!fOkToBeSlow) {
             *pCmdState = ECS_HIDDEN;
             return S_OK;
         }
+
+        // Hide from virtual folders (This PC, Recycle Bin, Network, Libraries, etc.)
+        IShellItemArray* items = psiItemArray ? psiItemArray : m_pSelection;
+        if (!IsValidFilesystemLocation(items)) {
+            *pCmdState = ECS_HIDDEN;
+            return S_OK;
+        }
+
         *pCmdState = ECS_ENABLED;
         return S_OK;
     }
+
     IFACEMETHODIMP GetFlags(EXPCMDFLAGS* pFlags) override {
         if (!pFlags) return E_POINTER;
         *pFlags = ECF_DEFAULT;
@@ -106,7 +159,7 @@ public:
         CoTaskMemFree(rawPath);
         item->Release();
 
-        // If target is a file, use its parent directory
+        // If a file was right-clicked, open cmd in its parent directory
         if (!PathIsDirectoryW(targetDir.c_str())) {
             WCHAR parentDir[MAX_PATH] = { 0 };
             wcscpy_s(parentDir, targetDir.c_str());
@@ -114,7 +167,6 @@ public:
             targetDir = parentDir;
         }
 
-        // Launch cmd.exe with working directory set to targetDir
         ShellExecuteW(nullptr, L"open", L"C:\\Windows\\System32\\cmd.exe", nullptr, targetDir.c_str(), SW_SHOWNORMAL);
         return S_OK;
     }

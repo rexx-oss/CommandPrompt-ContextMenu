@@ -16,12 +16,10 @@ static const CLSID CLSID_CmdCommand =
 class CmdCommand : public IExplorerCommand, public IObjectWithSelection, public IObjectWithSite
 {
     LONG m_cRef = 1;
-    IShellItemArray* m_pSelection = nullptr;
     IUnknown* m_pSite = nullptr;
 
 public:
     ~CmdCommand() {
-        if (m_pSelection) { m_pSelection->Release(); m_pSelection = nullptr; }
         if (m_pSite) { m_pSite->Release(); m_pSite = nullptr; }
     }
 
@@ -42,7 +40,7 @@ public:
         return cRef;
     }
 
-    // IObjectWithSite
+    // IObjectWithSite (Retrieves folder path for empty space clicks)
     IFACEMETHODIMP SetSite(IUnknown* pUnkSite) override {
         if (m_pSite) { m_pSite->Release(); m_pSite = nullptr; }
         if (pUnkSite) {
@@ -57,22 +55,15 @@ public:
         return m_pSite ? m_pSite->QueryInterface(riid, ppv) : E_NOINTERFACE;
     }
 
-    // IObjectWithSelection
-    IFACEMETHODIMP SetSelection(IShellItemArray* psia) override {
-        if (m_pSelection) { m_pSelection->Release(); m_pSelection = nullptr; }
-        if (psia) {
-            m_pSelection = psia;
-            m_pSelection->AddRef();
-        }
-        return S_OK;
-    }
-    IFACEMETHODIMP GetSelection(REFIID riid, void** ppv) override {
+    // IObjectWithSelection (Unused for background, but required by shell)
+    IFACEMETHODIMP SetSelection(IShellItemArray*) override { return S_OK; }
+    IFACEMETHODIMP GetSelection(REFIID, void** ppv) override {
         if (!ppv) return E_POINTER;
         *ppv = nullptr;
-        return m_pSelection ? m_pSelection->QueryInterface(riid, ppv) : E_NOINTERFACE;
+        return E_NOINTERFACE;
     }
 
-    // Resolves active folder path when clicking empty space
+    // Resolves current folder path from Explorer site
     std::wstring GetCurrentFolderFromSite() {
         if (!m_pSite) return L"";
 
@@ -121,57 +112,29 @@ public:
         return S_OK;
     }
 
-    // Dynamic visibility check
     IFACEMETHODIMP GetState(IShellItemArray* psiItemArray, BOOL fOkToBeSlow, EXPCMDSTATE* pCmdState) override {
         if (!pCmdState) return E_POINTER;
 
-        // Hide from classic context menu
+        // Hide from classic context menu ("Show more options")
         if (!fOkToBeSlow) {
             *pCmdState = ECS_HIDDEN;
             return S_OK;
         }
 
-        IShellItemArray* items = psiItemArray ? psiItemArray : m_pSelection;
-        DWORD count = 0;
-        if (items) items->GetCount(&count);
-
-        // CASE 1: Right-clicking empty background space
-        if (count == 0) {
-            std::wstring folder = GetCurrentFolderFromSite();
-            // Virtual locations (This PC, Recycle Bin) have no filesystem path -> Hide
-            if (folder.empty() || !PathFileExistsW(folder.c_str())) {
+        // If files or folders are selected, NEVER show Command Prompt
+        if (psiItemArray) {
+            DWORD count = 0;
+            if (SUCCEEDED(psiItemArray->GetCount(&count)) && count > 0) {
                 *pCmdState = ECS_HIDDEN;
                 return S_OK;
             }
-            *pCmdState = ECS_ENABLED;
-            return S_OK;
         }
 
-        // CASE 2: Right-clicking an item (file, folder, or drive)
-        IShellItem* item = nullptr;
-        if (SUCCEEDED(items->GetItemAt(0, &item))) {
-            SFGAOF attributes = 0;
-            if (FAILED(item->GetAttributes(SFGAO_FILESYSTEM, &attributes)) || !(attributes & SFGAO_FILESYSTEM)) {
-                item->Release();
-                *pCmdState = ECS_HIDDEN;
-                return S_OK;
-            }
-
-            PWSTR rawPath = nullptr;
-            if (FAILED(item->GetDisplayName(SIGDN_FILESYSPATH, &rawPath))) {
-                item->Release();
-                *pCmdState = ECS_HIDDEN;
-                return S_OK;
-            }
-
-            std::wstring path = rawPath;
-            CoTaskMemFree(rawPath);
-            item->Release();
-
-            if (path.empty() || !PathFileExistsW(path.c_str())) {
-                *pCmdState = ECS_HIDDEN;
-                return S_OK;
-            }
+        // Only show if the current background is a valid filesystem folder
+        std::wstring folder = GetCurrentFolderFromSite();
+        if (folder.empty() || !PathFileExistsW(folder.c_str())) {
+            *pCmdState = ECS_HIDDEN;
+            return S_OK;
         }
 
         *pCmdState = ECS_ENABLED;
@@ -188,33 +151,8 @@ public:
         return E_NOTIMPL;
     }
 
-    IFACEMETHODIMP Invoke(IShellItemArray* psiItemArray, IBindCtx*) override {
-        IShellItemArray* items = psiItemArray ? psiItemArray : m_pSelection;
-        DWORD count = 0;
-        if (items) items->GetCount(&count);
-
-        std::wstring targetDir;
-
-        if (count == 0) {
-            targetDir = GetCurrentFolderFromSite();
-        } else {
-            IShellItem* item = nullptr;
-            if (SUCCEEDED(items->GetItemAt(0, &item))) {
-                PWSTR rawPath = nullptr;
-                if (SUCCEEDED(item->GetDisplayName(SIGDN_FILESYSPATH, &rawPath))) {
-                    targetDir = rawPath;
-                    CoTaskMemFree(rawPath);
-                }
-                item->Release();
-            }
-
-            if (!targetDir.empty() && !PathIsDirectoryW(targetDir.c_str())) {
-                WCHAR parentDir[MAX_PATH] = { 0 };
-                wcscpy_s(parentDir, targetDir.c_str());
-                PathRemoveFileSpecW(parentDir);
-                targetDir = parentDir;
-            }
-        }
+    IFACEMETHODIMP Invoke(IShellItemArray*, IBindCtx*) override {
+        std::wstring targetDir = GetCurrentFolderFromSite();
 
         if (targetDir.empty() || !PathFileExistsW(targetDir.c_str())) {
             return S_OK;

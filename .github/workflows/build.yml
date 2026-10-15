@@ -1,0 +1,101 @@
+name: Build CommandPrompt-ContextMenu Package
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up MSVC environment
+        uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Compile COM DLL
+        run: |
+          cl.exe /LD /O2 /EHsc CmdCommand.cpp /link /DEF:CmdCommand.def /OUT:CmdCommand.dll shlwapi.lib shell32.lib ole32.lib
+
+      - name: Create Clean Package Layout & Sign
+        shell: powershell
+        run: |
+          New-Item -ItemType Directory -Path staging/Assets -Force | Out-Null
+          Copy-Item AppxManifest.xml staging/
+          Copy-Item CmdCommand.dll staging/
+          Copy-Item "$env:SystemRoot\System32\cmd.exe" staging/cmd.exe
+
+          Add-Type -AssemblyName System.Drawing
+          $drawingDll = [System.Drawing.Bitmap].Assembly.Location
+
+          $code = [string]::Join("`n", @(
+              'using System;',
+              'using System.Drawing;',
+              'using System.Runtime.InteropServices;',
+              'public class HighResIcon {',
+              '    [DllImport("user32.dll", CharSet = CharSet.Auto)]',
+              '    public static extern uint PrivateExtractIcons(string f, int idx, int cx, int cy, IntPtr[] ph, int[] id, uint n, uint fl);',
+              '    [DllImport("user32.dll")] public static extern bool DestroyIcon(IntPtr h);',
+              '    public static Bitmap Get256(string file) {',
+              '        IntPtr[] ph = new IntPtr[1]; int[] id = new int[1];',
+              '        uint c = PrivateExtractIcons(file, 0, 256, 256, ph, id, 1, 0);',
+              '        if (c > 0 && ph[0] != IntPtr.Zero) {',
+              '            Bitmap b = (Bitmap)Bitmap.FromHicon(ph[0]).Clone();',
+              '            DestroyIcon(ph[0]);',
+              '            return b;',
+              '        }',
+              '        return null;',
+              '    }',
+              '}'
+          ))
+          
+          Add-Type -TypeDefinition $code -ReferencedAssemblies $drawingDll
+          $bmp256 = [HighResIcon]::Get256("$env:SystemRoot\System32\cmd.exe")
+
+          $sizes = @{
+              "staging/Assets/Square150x150Logo.png" = 150
+              "staging/Assets/Square44x44Logo.png"   = 44
+              "staging/Assets/StoreLogo.png"         = 50
+          }
+          foreach ($path in $sizes.Keys) {
+              $dim = $sizes[$path]
+              $target = New-Object System.Drawing.Bitmap $dim, $dim
+              $g = [System.Drawing.Graphics]::FromImage($target)
+              $g.InterpolationMode = [System.Drawing.Drawing2D.InterpolationMode]::HighQualityBicubic
+              $g.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::HighQuality
+              $g.PixelOffsetMode = [System.Drawing.Drawing2D.PixelOffsetMode]::HighQuality
+              $g.DrawImage($bmp256, 0, 0, $dim, $dim)
+              $g.Dispose()
+              $target.Save($path, [System.Drawing.Imaging.ImageFormat]::Png)
+              $target.Dispose()
+          }
+          $bmp256.Dispose()
+
+          # Certificate
+          $cert = New-SelfSignedCertificate -Type Custom `
+            -Subject "CN=CommandPrompt-ContextMenu" `
+            -KeyUsage DigitalSignature `
+            -FriendlyName "CommandPrompt-ContextMenu" `
+            -CertStoreLocation "Cert:\CurrentUser\My" `
+            -TextExtension @("2.5.29.37={text}1.3.6.1.5.5.7.3.3")
+
+          $certBytes = $cert.Export([System.Security.Cryptography.X509Certificates.X509ContentType]::Cert)
+          [System.IO.File]::WriteAllBytes("staging/CommandPrompt-ContextMenu.cer", $certBytes)
+
+          $kitBin = (Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\bin\*\x64" | Select-Object -Last 1).FullName
+          & "$kitBin\makeappx.exe" pack /d staging /p staging/CmdMenu.msix /nv
+          & "$kitBin\signtool.exe" sign /fd SHA256 /a /s My /n "CommandPrompt-ContextMenu" staging/CmdMenu.msix
+
+      - name: Bundle Release Zip
+        shell: powershell
+        run: |
+          Copy-Item install.ps1 staging/
+          Copy-Item uninstall.ps1 staging/
+          Compress-Archive -Path staging/* -DestinationPath CommandPrompt-ContextMenu.zip
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: CommandPrompt-ContextMenu
+          path: CommandPrompt-ContextMenu.zip

@@ -12,60 +12,24 @@
 static const CLSID CLSID_CmdCommand = 
     { 0xd3a8e4f1, 0x6b22, 0x4d90, { 0x9e, 0x11, 0x5a, 0x8e, 0x89, 0x3c, 0x41, 0x77 } };
 
-// Validates that the target is a genuine physical filesystem folder/file
-bool IsValidFilesystemLocation(IShellItemArray* psiItemArray) {
-    if (!psiItemArray) return false;
-    DWORD count = 0;
-    if (FAILED(psiItemArray->GetCount(&count)) || count == 0) return false;
-
-    IShellItem* item = nullptr;
-    if (FAILED(psiItemArray->GetItemAt(0, &item))) return false;
-
-    // Reject virtual locations (This PC, Recycle Bin, Network, Control Panel, Phones/MTP)
-    SFGAOF attributes = 0;
-    if (FAILED(item->GetAttributes(SFGAO_FILESYSTEM, &attributes)) || !(attributes & SFGAO_FILESYSTEM)) {
-        item->Release();
-        return false;
-    }
-
-    PWSTR rawPath = nullptr;
-    if (FAILED(item->GetDisplayName(SIGDN_FILESYSPATH, &rawPath))) {
-        item->Release();
-        return false;
-    }
-
-    std::wstring path = rawPath;
-    CoTaskMemFree(rawPath);
-    item->Release();
-
-    if (path.empty()) return false;
-
-    // Check if it's an existing directory or drive (C:\, D:\, folders)
-    if (PathIsDirectoryW(path.c_str())) {
-        return PathFileExistsW(path.c_str()) != FALSE;
-    }
-
-    // If it's a file, ensure its parent directory exists
-    WCHAR parentDir[MAX_PATH] = { 0 };
-    wcscpy_s(parentDir, path.c_str());
-    PathRemoveFileSpecW(parentDir);
-    return PathIsDirectoryW(parentDir) != FALSE;
-}
-
-class CmdCommand : public IExplorerCommand, public IObjectWithSelection
+class CmdCommand : public IExplorerCommand, public IObjectWithSelection, public IObjectWithSite
 {
     LONG m_cRef = 1;
     IShellItemArray* m_pSelection = nullptr;
+    IUnknown* m_pSite = nullptr;
 
 public:
     ~CmdCommand() {
         if (m_pSelection) { m_pSelection->Release(); m_pSelection = nullptr; }
+        if (m_pSite) { m_pSite->Release(); m_pSite = nullptr; }
     }
 
+    // IUnknown
     IFACEMETHODIMP QueryInterface(REFIID riid, void** ppv) override {
         static const QITAB qit[] = {
             QITABENT(CmdCommand, IExplorerCommand),
             QITABENT(CmdCommand, IObjectWithSelection),
+            QITABENT(CmdCommand, IObjectWithSite),
             { 0 },
         };
         return QISearch(this, qit, riid, ppv);
@@ -77,6 +41,22 @@ public:
         return cRef;
     }
 
+    // IObjectWithSite (Used to identify the folder when right-clicking blank space)
+    IFACEMETHODIMP SetSite(IUnknown* pUnkSite) override {
+        if (m_pSite) { m_pSite->Release(); m_pSite = nullptr; }
+        if (pUnkSite) {
+            m_pSite = pUnkSite;
+            m_pSite->AddRef();
+        }
+        return S_OK;
+    }
+    IFACEMETHODIMP GetSite(REFIID riid, void** ppv) override {
+        if (!ppv) return E_POINTER;
+        *ppv = nullptr;
+        return m_pSite ? m_pSite->QueryInterface(riid, ppv) : E_NOINTERFACE;
+    }
+
+    // IObjectWithSelection
     IFACEMETHODIMP SetSelection(IShellItemArray* psia) override {
         if (m_pSelection) { m_pSelection->Release(); m_pSelection = nullptr; }
         if (psia) {
@@ -89,6 +69,47 @@ public:
         if (!ppv) return E_POINTER;
         *ppv = nullptr;
         return m_pSelection ? m_pSelection->QueryInterface(riid, ppv) : E_NOINTERFACE;
+    }
+
+    // Helper: Gets the folder path when right-clicking background
+    std::wstring GetCurrentFolderFromSite() {
+        if (!m_pSite) return L"";
+
+        IServiceProvider* pProvider = nullptr;
+        if (SUCCEEDED(m_pSite->QueryInterface(IID_PPV_ARGS(&pProvider)))) {
+            IShellBrowser* pBrowser = nullptr;
+            if (SUCCEEDED(pProvider->QueryService(SID_SShellBrowser, IID_PPV_ARGS(&pBrowser)))) {
+                IShellView* pView = nullptr;
+                if (SUCCEEDED(pBrowser->QueryActiveShellView(&pView))) {
+                    IFolderView* pFolderView = nullptr;
+                    if (SUCCEEDED(pView->QueryInterface(IID_PPV_ARGS(&pFolderView)))) {
+                        IPersistFolder2* pPersist = nullptr;
+                        if (SUCCEEDED(pFolderView->GetFolder(IID_PPV_ARGS(&pPersist)))) {
+                            PIDLIST_ABSOLUTE pidl = nullptr;
+                            if (SUCCEEDED(pPersist->GetCurFolder(&pidl)) && pidl) {
+                                WCHAR path[MAX_PATH] = { 0 };
+                                if (SHGetPathFromIDListW(pidl, path)) {
+                                    CoTaskMemFree(pidl);
+                                    pPersist->Release();
+                                    pFolderView->Release();
+                                    pView->Release();
+                                    pBrowser->Release();
+                                    pProvider->Release();
+                                    return path;
+                                }
+                                CoTaskMemFree(pidl);
+                            }
+                            pPersist->Release();
+                        }
+                        pFolderView->Release();
+                    }
+                    pView->Release();
+                }
+                pBrowser->Release();
+            }
+            pProvider->Release();
+        }
+        return L"";
     }
 
     IFACEMETHODIMP GetTitle(IShellItemArray*, PWSTR* ppszName) override {
@@ -117,11 +138,48 @@ public:
             return S_OK;
         }
 
-        // Hide from virtual folders (This PC, Recycle Bin, Network, Libraries, etc.)
         IShellItemArray* items = psiItemArray ? psiItemArray : m_pSelection;
-        if (!IsValidFilesystemLocation(items)) {
-            *pCmdState = ECS_HIDDEN;
+        DWORD count = 0;
+        if (items) items->GetCount(&count);
+
+        // CASE 1: Right-clicking EMPTY BACKGROUND (Folder background or Desktop)
+        if (count == 0) {
+            std::wstring folder = GetCurrentFolderFromSite();
+            // If the background folder is a virtual location (like "This PC"), it has no DOS path -> Hide
+            if (folder.empty() || !PathFileExistsW(folder.c_str())) {
+                *pCmdState = ECS_HIDDEN;
+                return S_OK;
+            }
+            *pCmdState = ECS_ENABLED;
             return S_OK;
+        }
+
+        // CASE 2: Right-clicking AN ITEM (File, Folder, or Drive)
+        IShellItem* item = nullptr;
+        if (SUCCEEDED(items->GetItemAt(0, &item))) {
+            SFGAOF attributes = 0;
+            // Reject virtual items (e.g. This PC, Network, Recycle Bin icons)
+            if (FAILED(item->GetAttributes(SFGAO_FILESYSTEM, &attributes)) || !(attributes & SFGAO_FILESYSTEM)) {
+                item->Release();
+                *pCmdState = ECS_HIDDEN;
+                return S_OK;
+            }
+
+            PWSTR rawPath = nullptr;
+            if (FAILED(item->GetDisplayName(SIGDN_FILESYSPATH, &rawPath))) {
+                item->Release();
+                *pCmdState = ECS_HIDDEN;
+                return S_OK;
+            }
+
+            std::wstring path = rawPath;
+            CoTaskMemFree(rawPath);
+            item->Release();
+
+            if (path.empty() || !PathFileExistsW(path.c_str())) {
+                *pCmdState = ECS_HIDDEN;
+                return S_OK;
+            }
         }
 
         *pCmdState = ECS_ENABLED;
@@ -140,31 +198,36 @@ public:
 
     IFACEMETHODIMP Invoke(IShellItemArray* psiItemArray, IBindCtx*) override {
         IShellItemArray* items = psiItemArray ? psiItemArray : m_pSelection;
-        if (!items) return S_OK;
-
         DWORD count = 0;
-        items->GetCount(&count);
-        if (count == 0) return S_OK;
+        if (items) items->GetCount(&count);
 
-        IShellItem* item = nullptr;
-        if (FAILED(items->GetItemAt(0, &item))) return S_OK;
+        std::wstring targetDir;
 
-        PWSTR rawPath = nullptr;
-        if (FAILED(item->GetDisplayName(SIGDN_FILESYSPATH, &rawPath))) {
-            item->Release();
-            return S_OK;
+        // If invoked on empty background
+        if (count == 0) {
+            targetDir = GetCurrentFolderFromSite();
+        } else {
+            IShellItem* item = nullptr;
+            if (SUCCEEDED(items->GetItemAt(0, &item))) {
+                PWSTR rawPath = nullptr;
+                if (SUCCEEDED(item->GetDisplayName(SIGDN_FILESYSPATH, &rawPath))) {
+                    targetDir = rawPath;
+                    CoTaskMemFree(rawPath);
+                }
+                item->Release();
+            }
+
+            // If a file was selected, open in its parent directory
+            if (!targetDir.empty() && !PathIsDirectoryW(targetDir.c_str())) {
+                WCHAR parentDir[MAX_PATH] = { 0 };
+                wcscpy_s(parentDir, targetDir.c_str());
+                PathRemoveFileSpecW(parentDir);
+                targetDir = parentDir;
+            }
         }
 
-        std::wstring targetDir = rawPath;
-        CoTaskMemFree(rawPath);
-        item->Release();
-
-        // If a file was right-clicked, open cmd in its parent directory
-        if (!PathIsDirectoryW(targetDir.c_str())) {
-            WCHAR parentDir[MAX_PATH] = { 0 };
-            wcscpy_s(parentDir, targetDir.c_str());
-            PathRemoveFileSpecW(parentDir);
-            targetDir = parentDir;
+        if (targetDir.empty() || !PathFileExistsW(targetDir.c_str())) {
+            return S_OK;
         }
 
         ShellExecuteW(nullptr, L"open", L"C:\\Windows\\System32\\cmd.exe", nullptr, targetDir.c_str(), SW_SHOWNORMAL);

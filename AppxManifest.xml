@@ -53,20 +53,11 @@
           </com:ComServer>
         </com:Extension>
 
-        <!-- Context menu for folders, folder backgrounds, and files -->
+        <!-- Exclusively for empty space / background context menu -->
         <desktop4:Extension Category="windows.fileExplorerContextMenus">
           <desktop4:FileExplorerContextMenus>
-            <!-- Right-clicking a folder or drive root -->
-            <desktop5:ItemType Type="Directory">
-              <desktop5:Verb Id="CmdFolder" Clsid="D3A8E4F1-6B22-4D90-9E11-5A8E893C4177" />
-            </desktop5:ItemType>
-            <!-- Right-clicking blank space inside a folder or Desktop -->
             <desktop5:ItemType Type="Directory\Background">
               <desktop5:Verb Id="CmdBackground" Clsid="D3A8E4F1-6B22-4D90-9E11-5A8E893C4177" />
-            </desktop5:ItemType>
-            <!-- Right-clicking any file (opens in parent folder) -->
-            <desktop5:ItemType Type="*">
-              <desktop5:Verb Id="CmdFile" Clsid="D3A8E4F1-6B22-4D90-9E11-5A8E893C4177" />
             </desktop5:ItemType>
           </desktop4:FileExplorerContextMenus>
         </desktop4:Extension>

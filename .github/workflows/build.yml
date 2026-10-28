@@ -18,14 +18,16 @@ jobs:
         run: |
           cl.exe /LD /O2 /EHsc CmdCommand.cpp /link /DEF:CmdCommand.def /OUT:CmdCommand.dll shlwapi.lib shell32.lib ole32.lib
 
-      - name: Create Clean Package Layout & Sign
+      - name: Package and Sign
         shell: powershell
         run: |
-          New-Item -ItemType Directory -Path staging/Assets -Force | Out-Null
-          Copy-Item AppxManifest.xml staging/
-          Copy-Item CmdCommand.dll staging/
-          Copy-Item "$env:SystemRoot\System32\cmd.exe" staging/cmd.exe
+          # 1. Temporary folder for makeappx packaging
+          New-Item -ItemType Directory -Path appx_staging/Assets -Force | Out-Null
+          Copy-Item AppxManifest.xml appx_staging/
+          Copy-Item CmdCommand.dll appx_staging/
+          Copy-Item "$env:SystemRoot\System32\cmd.exe" appx_staging/cmd.exe
 
+          # Load drawing assembly and resolve exact assembly location
           Add-Type -AssemblyName System.Drawing
           $drawingDll = [System.Drawing.Bitmap].Assembly.Location
 
@@ -53,10 +55,11 @@ jobs:
           Add-Type -TypeDefinition $code -ReferencedAssemblies $drawingDll
           $bmp256 = [HighResIcon]::Get256("$env:SystemRoot\System32\cmd.exe")
 
+          # Downscale with HighQualityBicubic for crisp retina icons
           $sizes = @{
-              "staging/Assets/Square150x150Logo.png" = 150
-              "staging/Assets/Square44x44Logo.png"   = 44
-              "staging/Assets/StoreLogo.png"         = 50
+              "appx_staging/Assets/Square150x150Logo.png" = 150
+              "appx_staging/Assets/Square44x44Logo.png"   = 44
+              "appx_staging/Assets/StoreLogo.png"         = 50
           }
           foreach ($path in $sizes.Keys) {
               $dim = $sizes[$path]
@@ -72,6 +75,9 @@ jobs:
           }
           $bmp256.Dispose()
 
+          # 2. Output folder with ONLY the final installation files
+          New-Item -ItemType Directory -Path dist -Force | Out-Null
+
           # Certificate
           $cert = New-SelfSignedCertificate -Type Custom `
             -Subject "CN=rexx" `
@@ -81,21 +87,20 @@ jobs:
             -TextExtension @("2.5.29.37={text}1.3.6.1.5.5.7.3.3")
 
           $certBytes = $cert.Export([System.Security.Cryptography.X509Certificates.X509ContentType]::Cert)
-          [System.IO.File]::WriteAllBytes("staging/CommandPrompt-ContextMenu.cer", $certBytes)
+          [System.IO.File]::WriteAllBytes("dist/CommandPrompt-ContextMenu.cer", $certBytes)
 
+          # Pack & Sign MSIX directly into dist
           $kitBin = (Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\bin\*\x64" | Select-Object -Last 1).FullName
-          & "$kitBin\makeappx.exe" pack /d staging /p staging/CmdMenu.msix /nv
-          & "$kitBin\signtool.exe" sign /fd SHA256 /a /s My /n "rexx" staging/CmdMenu.msix
+          & "$kitBin\makeappx.exe" pack /d appx_staging /p dist/CmdMenu.msix /nv
+          & "$kitBin\signtool.exe" sign /fd SHA256 /a /s My /n "rexx" dist/CmdMenu.msix
 
-      - name: Bundle Release Zip
-        shell: powershell
-        run: |
-          Copy-Item install.ps1 staging/
-          Copy-Item uninstall.ps1 staging/
-          Compress-Archive -Path staging/* -DestinationPath CommandPrompt-ContextMenu.zip
+          # Add installer scripts
+          Copy-Item install.ps1 dist/
+          Copy-Item uninstall.ps1 dist/
 
+      # Upload the dist folder directly (GitHub zips it once, no zip inside a zip)
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
           name: CommandPrompt-ContextMenu
-          path: CommandPrompt-ContextMenu.zip
+          path: dist/

@@ -26,10 +26,16 @@ jobs:
           mkdir -p release-files
           gh run download -n CommandPrompt-ContextMenu -D release-files
 
-      - name: Create GitHub Release
+      - name: Create Clean Release Zip
+        run: |
+          cd release-files
+          zip -r ../CommandPrompt-ContextMenu.zip ./*
+          cd ..
+
+      - name: Publish GitHub Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          gh release create "${{ inputs.tag }}" release-files/CommandPrompt-ContextMenu.zip \
+          gh release create "${{ inputs.tag }}" CommandPrompt-ContextMenu.zip \
             --title "${{ inputs.tag }}" \
             --notes "Release ${{ inputs.tag }}"
